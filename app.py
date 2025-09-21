@@ -1,5 +1,6 @@
 import streamlit as st
 from sqlalchemy import text
+from sqlalchemy.exc import OperationalError
 import hashlib, hmac
 from datetime import date
 from typing import Optional
@@ -10,7 +11,6 @@ st.set_page_config(page_title="Neon + Streamlit • Employees & Attendance", pag
 # Simple Access Gate
 # =========================
 def _sha256(s: str) -> str:
-    import hashlib
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 def _get_query_param(name: str) -> Optional[str]:
@@ -30,7 +30,8 @@ def require_login() -> bool:
             st.success(f"Signed in ({st.session_state.get('_method')})")
             if st.button("Sign out", use_container_width=True):
                 st.session_state.clear()
-                st.rerun()
+                try: st.rerun()
+                except Exception: st.experimental_rerun()
         return True
 
     secrets_auth = st.secrets.get("auth", {})
@@ -45,7 +46,8 @@ def require_login() -> bool:
     if token and token in allowed_tokens:
         st.session_state["_authed"] = True
         st.session_state["_method"] = "token"
-        st.rerun()
+        try: st.rerun()
+        except Exception: st.experimental_rerun()
 
     # Password in sidebar
     with st.sidebar:
@@ -61,7 +63,8 @@ def require_login() -> bool:
                 st.session_state["_authed"] = True
                 st.session_state["_method"] = "password"
                 st.toast("Signed in")
-                st.rerun()
+                try: st.rerun()
+                except Exception: st.experimental_rerun()
             else:
                 st.error("Invalid password")
     st.info("Enter the access password to continue.")
@@ -71,82 +74,135 @@ if not require_login():
     st.stop()
 
 # =========================
-# DB Connection
+# Connections (pooled + optional admin)
 # =========================
-conn = st.connection("neon", type="sql")
+# Use pool_pre_ping to avoid stale pooled connections
+conn = st.connection("neon", type="sql", engine_kwargs={"pool_pre_ping": True})
 
-# Ensure ONLY attendance table (employees already exists)
-with conn.session as s:
-    s.execute(text("""
-        CREATE TABLE IF NOT EXISTS app.attendance_log (
-            log_id BIGSERIAL PRIMARY KEY,
-            employee_id TEXT NOT NULL REFERENCES app.employees(employee_id)
-                ON UPDATE CASCADE ON DELETE RESTRICT,
-            date DATE NOT NULL,
-            check_in_time TIMESTAMPTZ,
-            check_out_time TIMESTAMPTZ,
-            status TEXT,
-            notes TEXT,
-            CONSTRAINT attendance_unique_per_day UNIQUE (employee_id, date)
+def _has_attendance_table() -> bool:
+    try:
+        df = conn.query(
+            "SELECT 1 FROM information_schema.tables "
+            "WHERE table_schema='app' AND table_name='attendance_log' LIMIT 1",
+            ttl=0
         )
-    """))
-    s.execute(text("""
-        CREATE INDEX IF NOT EXISTS idx_attendance_employee_date
-        ON app.attendance_log (employee_id, date)
-    """))
-    s.commit()
+        return not df.empty
+    except OperationalError as e:
+        st.error(f"Metadata check failed: {e}")
+        return False
+    except Exception as e:
+        st.error(f"Metadata check error: {e}")
+        return False
+
+def _bootstrap_via_admin():
+    # Try to open a direct (non-pooled) admin connection if provided
+    try:
+        conn_admin = st.connection("neon_admin", type="sql", engine_kwargs={"pool_pre_ping": True})
+    except Exception:
+        conn_admin = None
+
+    if conn_admin is None:
+        st.warning(
+            "Table app.attendance_log is missing and no direct admin connection is configured.\n"
+            "Open Neon SQL Editor and run the provided DDL to create it."
+        )
+        return False
+
+    try:
+        with conn_admin.session as s:
+            s.execute(text("CREATE SCHEMA IF NOT EXISTS app"))
+            s.execute(text(\"\"\"
+                CREATE TABLE IF NOT EXISTS app.attendance_log (
+                    log_id BIGSERIAL PRIMARY KEY,
+                    employee_id TEXT NOT NULL REFERENCES app.employees(employee_id)
+                        ON UPDATE CASCADE ON DELETE RESTRICT,
+                    date DATE NOT NULL,
+                    check_in_time TIMESTAMPTZ,
+                    check_out_time TIMESTAMPTZ,
+                    status TEXT,
+                    notes TEXT,
+                    CONSTRAINT attendance_unique_per_day UNIQUE (employee_id, date)
+                )
+            \"\"\"))
+            s.execute(text(
+                "CREATE INDEX IF NOT EXISTS idx_attendance_employee_date "
+                "ON app.attendance_log (employee_id, date)"
+            ))
+            s.commit()
+        st.success("Initialized app.attendance_log via admin connection.")
+        return True
+    except OperationalError as e:
+        st.error(f"Admin DDL failed (connection issue): {e}")
+        return False
+    except Exception as e:
+        st.error(f"Admin DDL error: {e}")
+        return False
+
+# Ensure table exists WITHOUT running DDL over pooled connection
+if not _has_attendance_table():
+    if not _bootstrap_via_admin():
+        st.stop()
 
 st.title("Employees & Attendance")
 st.caption("Neon (Postgres) backend • Streamlit frontend")
 
+# =========================
 # Helpers
+# =========================
 def _list_employees(q: str = ""):
-    if q:
-        return conn.query("""
+    try:
+        if q:
+            return conn.query(\"\"\"
+                SELECT employee_id, first_name, last_name, email, department, job_title, status, hire_date, created_at
+                FROM app.employees
+                WHERE employee_id ILIKE :q
+                   OR first_name ILIKE :q
+                   OR last_name ILIKE :q
+                   OR email ILIKE :q
+                ORDER BY created_at DESC
+            \"\"\", params={"q": f"%{q}%"}, ttl="20s")
+        return conn.query(\"\"\"
             SELECT employee_id, first_name, last_name, email, department, job_title, status, hire_date, created_at
             FROM app.employees
-            WHERE employee_id ILIKE :q
-               OR first_name ILIKE :q
-               OR last_name ILIKE :q
-               OR email ILIKE :q
             ORDER BY created_at DESC
-        """, params={"q": f"%{q}%"}, ttl="20s")
-    return conn.query("""
-        SELECT employee_id, first_name, last_name, email, department, job_title, status, hire_date, created_at
-        FROM app.employees
-        ORDER BY created_at DESC
-    """, ttl="20s")
+        \"\"\", ttl="20s")
+    except OperationalError as e:
+        st.error(f"Employee list failed: {e}")
+        return conn.query("SELECT NULL WHERE FALSE", ttl=0)  # empty DF
 
 def _get_employee(eid: str):
-    df = conn.query("""
-        SELECT employee_id, first_name, last_name, email, department, job_title, status, hire_date
-        FROM app.employees WHERE employee_id = :eid
-    """, params={"eid": eid}, ttl=0)
-    return None if df.empty else df.iloc[0].to_dict()
+    try:
+        df = conn.query(\"\"\"
+            SELECT employee_id, first_name, last_name, email, department, job_title, status, hire_date
+            FROM app.employees WHERE employee_id = :eid
+        \"\"\", params={"eid": eid}, ttl=0)
+        return None if df.empty else df.iloc[0].to_dict()
+    except OperationalError as e:
+        st.error(f"Load employee failed: {e}")
+        return None
 
 def _employee_has_attendance(eid: str) -> int:
-    df = conn.query("""
-        SELECT COUNT(*) AS c FROM app.attendance_log WHERE employee_id = :eid
-    """, params={"eid": eid}, ttl=0)
-    return int(df.iloc[0]["c"])
+    try:
+        df = conn.query(
+            "SELECT COUNT(*) AS c FROM app.attendance_log WHERE employee_id = :eid",
+            params={"eid": eid}, ttl=0
+        )
+        return int(df.iloc[0]["c"])
+    except Exception:
+        return 0
 
 def _list_attendance(eid: Optional[str], d_from: Optional[date], d_to: Optional[date], status: str):
-    clauses = []
-    p = {}
+    clauses, p = [], {}
     if eid:
-        clauses.append("al.employee_id = :eid")
-        p["eid"] = eid
+        clauses.append("al.employee_id = :eid"); p["eid"] = eid
     if d_from:
-        clauses.append("al.date >= :dfrom")
-        p["dfrom"] = d_from.isoformat()
+        clauses.append("al.date >= :dfrom"); p["dfrom"] = d_from.isoformat()
     if d_to:
-        clauses.append("al.date <= :dto")
-        p["dto"] = d_to.isoformat()
+        clauses.append("al.date <= :dto"); p["dto"] = d_to.isoformat()
     if status and status != "Any":
-        clauses.append("COALESCE(al.status,'') = :st")
-        p["st"] = status
+        clauses.append("COALESCE(al.status,'') = :st"); p["st"] = status
     where = "WHERE " + " AND ".join(clauses) if clauses else ""
-    sql = f"""
+    sql = f\"\"\"
       SELECT
         al.log_id, al.date, al.employee_id,
         e.first_name, e.last_name,
@@ -156,10 +212,16 @@ def _list_attendance(eid: Optional[str], d_from: Optional[date], d_to: Optional[
       {where}
       ORDER BY al.date DESC, e.first_name, e.last_name
       LIMIT 500
-    """
-    return conn.query(sql, params=p, ttl="15s")
+    \"\"\"
+    try:
+        return conn.query(sql, params=p, ttl="15s")
+    except OperationalError as e:
+        st.error(f"Attendance query failed: {e}")
+        return conn.query("SELECT NULL WHERE FALSE", ttl=0)
 
+# =========================
 # UI Tabs
+# =========================
 tab_emp, tab_att, tab_health = st.tabs(["👤 Employees", "🕒 Attendance", "🩺 Health"])
 
 # =========================
@@ -184,16 +246,18 @@ with tab_emp:
             else:
                 try:
                     with conn.session as s:
-                        s.execute(text("""
+                        s.execute(text(\"\"\"
                             INSERT INTO app.employees
                               (employee_id, first_name, last_name, email, department, job_title, status, hire_date)
                             VALUES
                               (:eid, :fn, :ln, :em, :dp, :jt, :st, :hd)
-                        """), dict(eid=employee_id, fn=first_name, ln=last_name,
-                                   em=email or None, dp=department or None,
-                                   jt=job_title or None, st=status, hd=hire_date_.isoformat()))
+                        \"\"\"), dict(eid=employee_id, fn=first_name, ln=last_name,
+                                     em=email or None, dp=department or None,
+                                     jt=job_title or None, st=status, hd=hire_date_.isoformat()))
                         s.commit()
                     st.success(f"Employee {employee_id} created.")
+                except OperationalError as e:
+                    st.error(f"Create failed (connection): {e}")
                 except Exception as e:
                     st.error(f"Create failed: {e}")
 
@@ -207,7 +271,6 @@ with tab_emp:
     st.divider()
 
     st.subheader("Update / Delete")
-    # Select employee to edit
     mini = conn.query("SELECT employee_id, first_name, last_name FROM app.employees ORDER BY first_name, last_name", ttl="30s")
     if mini.empty:
         st.info("No employees yet.")
@@ -221,7 +284,6 @@ with tab_emp:
         else:
             with st.form("emp_update_delete", clear_on_submit=False):
                 c1, c2, c3 = st.columns(3)
-                # Employee ID is PK; keep as read-only in UI (you can add rename logic if needed)
                 c1.text_input("Employee ID", value=row["employee_id"], disabled=True)
                 fn = c2.text_input("First name *", value=row["first_name"])
                 ln = c3.text_input("Last name *", value=row["last_name"])
@@ -233,7 +295,7 @@ with tab_emp:
 
                 ucol1, ucol2, ucol3 = st.columns([1,1,1])
                 do_update = ucol1.form_submit_button("Save changes", use_container_width=True)
-                with_att = ucol2.checkbox("Also delete attendance logs", value=False, help="Needed if you want to delete an employee who has attendance rows.")
+                with_att = ucol2.checkbox("Also delete attendance logs", value=False, help="Needed if the employee has attendance rows.")
                 do_delete = ucol3.form_submit_button("Delete employee", use_container_width=True)
 
                 if do_update:
@@ -242,15 +304,17 @@ with tab_emp:
                     else:
                         try:
                             with conn.session as s:
-                                s.execute(text("""
+                                s.execute(text(\"\"\"
                                     UPDATE app.employees
                                        SET first_name=:fn, last_name=:ln, email=:em,
                                            department=:dp, job_title=:jt, status=:st, hire_date=:hd
                                      WHERE employee_id=:eid
-                                """), dict(fn=fn, ln=ln, em=em or None, dp=dp or None, jt=jt or None,
-                                           st=stt, hd=hd.isoformat(), eid=eid))
+                                \"\"\"), dict(fn=fn, ln=ln, em=em or None, dp=dp or None, jt=jt or None,
+                                             st=stt, hd=hd.isoformat(), eid=eid))
                                 s.commit()
                             st.success("Employee updated.")
+                        except OperationalError as e:
+                            st.error(f"Update failed (connection): {e}")
                         except Exception as e:
                             st.error(f"Update failed: {e}")
 
@@ -267,7 +331,10 @@ with tab_emp:
                                 s.commit()
                         if (cnt == 0) or with_att:
                             st.success("Employee deleted.")
-                            st.rerun()
+                            try: st.rerun()
+                            except Exception: st.experimental_rerun()
+                    except OperationalError as e:
+                        st.error(f"Delete failed (connection): {e}")
                     except Exception as e:
                         st.error(f"Delete failed: {e}")
 
@@ -276,7 +343,6 @@ with tab_emp:
 # =========================
 with tab_att:
     st.subheader("Quick actions (today)")
-    # employee list for actions and create form
     mini = conn.query("SELECT employee_id, first_name, last_name FROM app.employees ORDER BY first_name, last_name", ttl="30s")
     if mini.empty:
         st.info("No employees found. Create one in the Employees tab.")
@@ -290,40 +356,45 @@ with tab_att:
             if st.button("Check In (now)"):
                 try:
                     with conn.session as s:
-                        s.execute(text("""
+                        s.execute(text(\"\"\"
                             INSERT INTO app.attendance_log (employee_id, date, check_in_time, status)
                             VALUES (:eid, CURRENT_DATE, now(), 'Present')
                             ON CONFLICT (employee_id, date)
                             DO UPDATE SET check_in_time = COALESCE(app.attendance_log.check_in_time, EXCLUDED.check_in_time)
-                        """), {"eid": eid_q})
+                        \"\"\"), {"eid": eid_q})
                         s.commit()
                     st.success("Checked in.")
+                except OperationalError as e:
+                    st.error(f"Check-in failed (connection): {e}")
                 except Exception as e:
                     st.error(f"Check-in failed: {e}")
         with c2:
             if st.button("Check Out (now)"):
                 try:
                     with conn.session as s:
-                        res = s.execute(text("""
+                        res = s.execute(text(\"\"\"
                             UPDATE app.attendance_log
                                SET check_out_time = now()
                              WHERE employee_id=:eid AND date=CURRENT_DATE AND check_out_time IS NULL
-                        """), {"eid": eid_q})
+                        \"\"\"), {"eid": eid_q})
                         s.commit()
                     st.success("Checked out.") if res.rowcount else st.warning("No open check-in for today.")
+                except OperationalError as e:
+                    st.error(f"Check-out failed (connection): {e}")
                 except Exception as e:
                     st.error(f"Check-out failed: {e}")
         with c3:
             if st.button("Clear Check-out (today)"):
                 try:
                     with conn.session as s:
-                        res = s.execute(text("""
-                            UPDATE app.attendance_log
-                               SET check_out_time = NULL
-                             WHERE employee_id=:eid AND date=CURRENT_DATE
-                        """), {"eid": eid_q})
+                        res = s.execute(text(
+                            "UPDATE app.attendance_log SET check_out_time = NULL "
+                            "WHERE employee_id=:eid AND date=CURRENT_DATE"
+                        ), {"eid": eid_q})
                         s.commit()
                     st.success("Cleared.") if res.rowcount else st.info("No row to clear.")
+                except OperationalError as e:
+                    st.error(f"Clear failed (connection): {e}")
                 except Exception as e:
                     st.error(f"Clear failed: {e}")
         with c4:
@@ -331,18 +402,19 @@ with tab_att:
             if st.button("Set Status/Notes (today)"):
                 try:
                     with conn.session as s:
-                        s.execute(text("""
-                            INSERT INTO app.attendance_log (employee_id, date)
-                            VALUES (:eid, CURRENT_DATE)
-                            ON CONFLICT (employee_id, date) DO NOTHING
-                        """), {"eid": eid_q})
-                        s.execute(text("""
-                            UPDATE app.attendance_log
-                               SET status=:st, notes=:nt
-                             WHERE employee_id=:eid AND date=CURRENT_DATE
-                        """), {"st": new_status or None, "nt": new_status or None, "eid": eid_q})
+                        s.execute(text(
+                            "INSERT INTO app.attendance_log (employee_id, date) "
+                            "VALUES (:eid, CURRENT_DATE) "
+                            "ON CONFLICT (employee_id, date) DO NOTHING"
+                        ), {"eid": eid_q})
+                        s.execute(text(
+                            "UPDATE app.attendance_log SET status=:st, notes=:nt "
+                            "WHERE employee_id=:eid AND date=CURRENT_DATE"
+                        ), {"st": new_status or None, "nt": new_status or None, "eid": eid_q})
                         s.commit()
                     st.success("Status/notes updated.")
+                except OperationalError as e:
+                    st.error(f"Update failed (connection): {e}")
                 except Exception as e:
                     st.error(f"Update failed: {e}")
 
@@ -352,7 +424,7 @@ with tab_att:
     with st.form("att_create"):
         col1, col2, col3 = st.columns(3)
         if mini.empty:
-            eid_new = col1.text_input("Employee ID *", placeholder="E1001")  # fallback
+            eid_new = col1.text_input("Employee ID *", placeholder="E1001")
         else:
             choice_c = col1.selectbox("Employee *", options if not mini.empty else [], index=0 if not mini.empty else None)
             eid_new = mini.iloc[options.index(choice_c)]["employee_id"] if not mini.empty else None
@@ -365,22 +437,23 @@ with tab_att:
         if submitted_att:
             try:
                 with conn.session as s:
-                    s.execute(text("""
+                    s.execute(text(\"\"\"
                         INSERT INTO app.attendance_log (employee_id, date, status, notes)
                         VALUES (:eid, :dt, :st, :nt)
                         ON CONFLICT (employee_id, date)
                         DO UPDATE SET status = EXCLUDED.status, notes = EXCLUDED.notes
-                    """), {"eid": eid_new, "dt": date_new.isoformat(),
-                           "st": status_new or None, "nt": notes_new or None})
+                    \"\"\"), {"eid": eid_new, "dt": date_new.isoformat(),
+                             "st": status_new or None, "nt": notes_new or None})
                     s.commit()
                 st.success("Attendance created/updated.")
+            except OperationalError as e:
+                st.error(f"Create failed (connection): {e}")
             except Exception as e:
                 st.error(f"Create failed: {e}")
 
     st.divider()
     st.subheader("Read / Update / Delete")
 
-    # Filters
     colf1, colf2, colf3, colf4 = st.columns([1,1,1,1])
     eid_filter = None
     if not mini.empty:
@@ -393,10 +466,8 @@ with tab_att:
     att_df = _list_attendance(eid_filter, dfrom if dfrom != date.min else None, dto if dto != date.min else None, status_filter)
     st.dataframe(att_df, use_container_width=True, height=360)
 
-    # Row-level update/delete
     if not att_df.empty:
         with st.expander("Edit or delete a specific row"):
-            ids = att_df["log_id"].tolist()
             labels = [f"#{r.log_id} • {r.date} • {r.first_name} {r.last_name} ({r.employee_id})" for r in att_df.itertuples()]
             sel = st.selectbox("Pick a row", labels)
             idx = labels.index(sel)
@@ -407,20 +478,28 @@ with tab_att:
             if cc1.button("Set check-in = now()", key="btn_ci"):
                 try:
                     with conn.session as s:
-                        s.execute(text("UPDATE app.attendance_log SET check_in_time = now() WHERE log_id = :id"), {"id": int(row["log_id"])})
+                        s.execute(text("UPDATE app.attendance_log SET check_in_time = now() WHERE log_id = :id"),
+                                  {"id": int(row["log_id"])})
                         s.commit()
                     st.success("Updated check-in.")
-                    st.experimental_rerun()
+                    try: st.rerun()
+                    except Exception: st.experimental_rerun()
+                except OperationalError as e:
+                    st.error(f"Update failed (connection): {e}")
                 except Exception as e:
                     st.error(f"Update failed: {e}")
 
             if cc2.button("Set check-out = now()", key="btn_co"):
                 try:
                     with conn.session as s:
-                        s.execute(text("UPDATE app.attendance_log SET check_out_time = now() WHERE log_id = :id"), {"id": int(row["log_id"])})
+                        s.execute(text("UPDATE app.attendance_log SET check_out_time = now() WHERE log_id = :id"),
+                                  {"id": int(row["log_id"])})
                         s.commit()
                     st.success("Updated check-out.")
-                    st.experimental_rerun()
+                    try: st.rerun()
+                    except Exception: st.experimental_rerun()
+                except OperationalError as e:
+                    st.error(f"Update failed (connection): {e}")
                 except Exception as e:
                     st.error(f"Update failed: {e}")
 
@@ -430,14 +509,15 @@ with tab_att:
             if uu1.button("Save status/notes"):
                 try:
                     with conn.session as s:
-                        s.execute(text("""
-                            UPDATE app.attendance_log
-                               SET status=:st, notes=:nt
-                             WHERE log_id=:id
-                        """), {"st": new_status or None, "nt": new_notes or None, "id": int(row["log_id"])})
+                        s.execute(text(
+                            "UPDATE app.attendance_log SET status=:st, notes=:nt WHERE log_id=:id"
+                        ), {"st": new_status or None, "nt": new_notes or None, "id": int(row["log_id"])})
                         s.commit()
                     st.success("Row updated.")
-                    st.experimental_rerun()
+                    try: st.rerun()
+                    except Exception: st.experimental_rerun()
+                except OperationalError as e:
+                    st.error(f"Update failed (connection): {e}")
                 except Exception as e:
                     st.error(f"Update failed: {e}")
 
@@ -447,7 +527,10 @@ with tab_att:
                         s.execute(text("DELETE FROM app.attendance_log WHERE log_id=:id"), {"id": int(row["log_id"])})
                         s.commit()
                     st.success("Row deleted.")
-                    st.experimental_rerun()
+                    try: st.rerun()
+                    except Exception: st.experimental_rerun()
+                except OperationalError as e:
+                    st.error(f"Delete failed (connection): {e}")
                 except Exception as e:
                     st.error(f"Delete failed: {e}")
 
@@ -459,5 +542,7 @@ with tab_health:
     try:
         df = conn.query("SELECT now() AS server_time", ttl=0)
         st.write(df.iloc[0]["server_time"])
+    except OperationalError as e:
+        st.error(f"DB error (connection): {e}")
     except Exception as e:
         st.error(f"DB error: {e}")
