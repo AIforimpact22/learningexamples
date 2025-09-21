@@ -1,7 +1,75 @@
 import streamlit as st
 from sqlalchemy import text
+import hashlib, hmac
 
 st.set_page_config(page_title="Neon + Streamlit • Attendance", page_icon="🗄️", layout="centered")
+
+# ---------- Simple Access Gate (password or token) ----------
+def _sha256(s: str) -> str:
+    return hashlib.sha256(s.encode("utf-8")).hexdigest()
+
+def _get_query_param(name: str):
+    # Works on both new & older Streamlit versions
+    try:
+        # Newer: st.query_params (Mapping)
+        qp = st.query_params  # may raise on older versions
+        val = qp.get(name, None)
+        if isinstance(val, list):  # just in case
+            return val[0] if val else None
+        return val
+    except Exception:
+        # Older: experimental_get_query_params()
+        val = st.experimental_get_query_params().get(name, [None])
+        return val[0] if isinstance(val, list) else val
+
+def require_login() -> bool:
+    if st.session_state.get("_authed"):
+        with st.sidebar:
+            st.success("Signed in")
+            if st.button("Sign out"):
+                st.session_state.clear()
+                st.rerun()
+        return True
+
+    secrets_auth = st.secrets.get("auth", {})
+    # 1) Token via URL (?token=...)
+    token = _get_query_param("token")
+    allowed_tokens = set()
+    if "tokens" in secrets_auth:
+        allowed_tokens = {str(x) for x in secrets_auth["tokens"]}
+    elif "token" in secrets_auth:
+        allowed_tokens = {str(secrets_auth["token"])}
+
+    if token and token in allowed_tokens:
+        st.session_state["_authed"] = True
+        st.session_state["_method"] = "token"
+        st.rerun()
+
+    # 2) Password in sidebar
+    with st.sidebar:
+        st.markdown("### Sign in")
+        pw_input = st.text_input("Access password", type="password")
+        if st.button("Sign in", use_container_width=True):
+            ok = False
+            if "password_sha256" in secrets_auth:
+                ok = hmac.compare_digest(_sha256(pw_input), secrets_auth["password_sha256"])
+            elif "password" in secrets_auth:
+                ok = hmac.compare_digest(pw_input, secrets_auth["password"])
+            if ok:
+                st.session_state["_authed"] = True
+                st.session_state["_method"] = "password"
+                st.toast("Signed in")
+                st.rerun()
+            else:
+                st.error("Invalid password")
+    st.info("Enter the access password to continue.")
+    return False
+
+# Gate everything below
+if not require_login():
+    st.stop()
+
+# ---------- App content (unchanged except moved below the gate) ----------
 st.title("Employees + Attendance")
 st.caption("Neon (Postgres) backend • Streamlit frontend")
 
@@ -40,7 +108,6 @@ st.subheader("Attendance (Today)")
 if employees_df.empty:
     st.info("No employees found. Add employees first, then return to this page.")
 else:
-    # Choose an employee
     options = employees_df.apply(
         lambda r: f"{r['first_name']} {r['last_name']} ({r['employee_id']})", axis=1
     ).tolist()
@@ -85,7 +152,6 @@ else:
         if st.button("Set Status/Note"):
             try:
                 with conn.session as s:
-                    # Ensure row exists, then update status/notes
                     s.execute(text("""
                         INSERT INTO app.attendance_log (employee_id, date)
                         VALUES (:eid, CURRENT_DATE)
